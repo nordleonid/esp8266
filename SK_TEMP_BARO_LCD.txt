@@ -1,0 +1,1023 @@
+#include <FS.h>
+#include <Arduino.h>
+#include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
+
+// Wifi Manager
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
+#include <WiFiManager.h>         //https://github.com/tzapu/WiFiManager
+
+//OLED
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <TFT_ILI9163C.h>
+
+//clock
+#include <pgmspace.h>
+#include <TimeLib.h>
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <RtcDS3231.h>
+RtcDS3231<TwoWire> Rtc(Wire);
+#define countof(a) (sizeof(a) / sizeof(a[0]))
+//e-mail
+#include <ESP8266WiFiMulti.h>
+#include <ESP8266HTTPClient.h>
+#define USE_SERIAL Serial
+ESP8266WiFiMulti WiFiMulti;
+//e-mail, address
+char address[64] {"e-mail"};
+
+// HTTP requests
+#include <ESP8266HTTPClient.h>
+
+// OTA updates
+#include <ESP8266httpUpdate.h>
+// Blynk
+#include <BlynkSimpleEsp8266.h>
+
+// Debounce
+#include <Bounce2.h> //https://github.com/thomasfredericks/Bounce2
+
+// JSON
+#include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
+
+// Debounce interval in ms
+#define DEBOUNCE_INTERVAL 10
+
+Bounce hwReset {Bounce()};
+
+// Humidity/Temperature
+#include <DHT.h>
+#define DHTPIN 0    //D3 gpio0, DHT22 DATA
+#define DHTTYPE DHT22     // DHT 22
+DHT dht(DHTPIN, DHTTYPE);
+
+// Blynk token
+char blynk_token[33] {"Blynk token"};
+
+// Setup Wifi connection
+WiFiManager wifiManager;
+
+// Network credentials
+String ssid { "am180206" };
+String pass { "vb654321" };
+
+//flag for saving data
+bool shouldSaveConfig = false;
+
+// Sensors data
+float  t {-100}, t_old{-100};
+float  hic {-1}, hic_old{-1};
+int h {-1}, h_old{-1};
+int co2 {-1}, co2_old{-1};
+char Tmn[5]{}, Tmx[5]{}, Hmn[5]{}, Cmx[7]{}, tZ[5]{}, timeSW[4]{}, formFS[]{"0"}; //пороговые значения t, h и co2, час. пояс
+float  Tmin, Tmax, Hmin, Cmax, tZone, timeSummerWinter, formatingFS;
+float trp = 0;
+int crbn, bl, ml=18000;
+int md; //режим работы: 1 - онлайн, 2 - автономный
+int blnk;
+
+// Color definitions
+#define  BLACK   0x0000
+#define BLUE    0x001F
+#define RED     0xF800
+#define GREEN   0x07E0
+#define CYAN    0x07FF
+#define MAGENTA 0xF81F
+#define YELLOW  0xFFE0  
+#define WHITE   0xFFFF
+#define GRAY    0x9999
+
+#define __CS 16   //D0(gpio16)- CS(display)
+#define __DC 2    //D4 gpio2 - AO(display)
+#define __RST 12   // D6  gpio12 - RESET(display) 
+
+ //char datestring[20];
+ char time_r[9];
+ char date_r[12];
+
+//analog clock
+uint16_t ccenterx = 64,ccentery = 70;//center x,y of the clock clock
+const uint16_t cradius = 40;//radius of the clock
+const float scosConst = 0.0174532925;
+float sx = 0, sy = 1, mx = 1, my = 0, hx = -1, hy = 0;
+float sdeg=0, mdeg=0, hdeg=0;
+uint16_t osx,osy,omx,omy,ohx,ohy;
+uint16_t x0 = 0, x1 = 0, yy0 = 0, yy1 = 0;
+//uint32_t targetTime = 0;// for next 1 second timeout
+uint8_t hh,mm,ss;  //containers for current time
+
+TFT_ILI9163C display = TFT_ILI9163C(__CS, __DC, __RST);
+
+String utf8(String source)
+{
+  int i,k;
+  String target;
+  unsigned char n;
+  char m[2] = { '0', '\0' };
+
+  k = source.length(); i = 0;
+
+  while (i < k) {
+    n = source[i]; i++;
+
+    if (n >= 0xC0) {
+      switch (n) {
+        case 0xD0: {
+          n = source[i]; i++;
+          if (n == 0x81) { n = 0xA8; break; }
+          if (n >= 0x90 && n <= 0xBF) n = n + 0x30;
+          break;
+        }
+        case 0xD1: {
+          n = source[i]; i++;
+          if (n == 0x91) { n = 0xB8; break; }
+          if (n >= 0x80 && n <= 0x8F) n = n + 0x70;
+          break;
+        }
+      }
+    }
+    m[0] = n; target = target + String(m);
+  }
+return target;
+}
+
+// NTP Servers:
+//static const char ntpServerName[] = "us.pool.ntp.org";
+static const char ntpServerName[] = "time.nist.gov";
+
+//const int timeZone = 2;     // Вильнюс, Киев, Рига, София, Таллин, Хельсинки
+//const int timeSummer = 1;
+
+WiFiUDP Udp;
+unsigned int localPort = 2390;  // local port to listen for UDP packets
+
+time_t getNtpTime();
+void digitalClockDisplay();
+void printDigits(int digits);
+void sendNTPpacket(IPAddress &address);
+
+void readCO2(){
+#define mySerial Serial
+static byte cmd[9] = {0xFF,0x01,0x86,0x00,0x00,0x00,0x00,0x00,0x79}; //команда чтения
+byte response[9];
+byte crc = 0;
+  while (mySerial.available())mySerial.read();//очистка буфера UART перед запросом 
+  memset(response, 0, 9);// очистка ответа
+  mySerial.write(cmd,9);// запрос на содержание CO2
+  mySerial.readBytes(response, 9);//читаем 9 байт ответа сенсора
+  //расчет контрольной суммы
+  crc = 0;
+  for (int i = 1; i <= 7; i++)
+  {
+    crc += response[i];
+  }
+  crc = ((~crc)+1);
+  {
+  //проверка CRC
+  if ( !(response[0] == 0xFF && response[1] == 0x86 && response[8] == crc) ) 
+  {
+    Serial.println("CRC error");
+  } else 
+      {
+       //расчет значеия CO2
+       co2 = (((unsigned int) response[2])<<8) + response[3];
+       Serial.println("CO2: " + String(co2) + "ppm");
+        }
+  }
+}
+
+void sendMeasurements() {
+float  t1 {-100}, hic1 {-1};
+float h1 {-1};
+        // Temperature
+        t1 = dht.readTemperature(); 
+       if ((t1 > -1) and (t1 < 100)) t = t1;
+       Serial.println("T: " + String(t) + "*C");
+
+        // Humidity
+        h1 = dht.readHumidity(); 
+        if ((h1 > -1) and (h1 < 100))  h = h1;
+        Serial.println("H: " + String(h) + "%");
+
+        // Humindex
+        hic1 = dht.computeHeatIndex(t, h, false);        
+        if (t >= 21.0) hic = hic1;
+        else  hic = t;
+        Serial.println("Ti: "+String(hic)+"*C"); 
+
+        // CO2
+        crbn++;
+        if (crbn > 110)
+             {readCO2();  
+              crbn = 0;
+              Serial.println("CO2: " + String(co2) + "ppm");
+             }
+}
+
+void drawConnectionDetails() {
+        display.clearScreen();
+        display.setTextSize(1);
+        display.setCursor(12,24);
+        display.setTextColor(WHITE);
+        display.println(utf8("Connect to WiFi:"));
+        display.setCursor(12,36);
+        display.println(utf8("net: " + String(ssid)));
+        display.setCursor(12,48);
+        display.println(utf8("pass: " + String(pass)));          
+        display.setCursor(12,60);
+        display.println(utf8("Open browser:"));          
+        display.setCursor(12,72);
+        display.println(utf8("http://192.168.4.1"));
+        display.setCursor(2,84);
+        display.setTextColor(RED);
+        display.println(utf8(" Enter your personal     information!"));
+}        
+
+void digitalClockDisplay()
+{
+  // digital clock display of the time
+  Serial.print(hour());
+  printDigits(minute());
+  printDigits(second());
+  Serial.print(" ");
+  Serial.print(day());
+  Serial.print(".");
+  Serial.print(month());
+  Serial.print(".");
+  Serial.print(year());
+  Serial.println(); 
+}
+
+void printDigits(int digits)
+{
+  // utility for digital clock display: prints preceding colon and leading 0
+  Serial.print(":");
+  if (digits < 10)
+    Serial.print('0');
+  Serial.print(digits);
+}
+
+// NTP code
+const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
+byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
+
+  time_t getNtpTime() {
+  int tZoneI, timeSummerWinterI;    
+  tZoneI = (int)tZone;  
+  timeSummerWinterI = (int)timeSummerWinterI;    
+  IPAddress ntpServerIP; // NTP server's ip address
+
+  while (Udp.parsePacket() > 0) ; // discard any previously received packets
+  Serial.println("Transmit NTP Request");
+  // get a random server from the pool
+  WiFi.hostByName(ntpServerName, ntpServerIP);
+  Serial.print(ntpServerName);
+  Serial.print(": ");
+  Serial.println(ntpServerIP);
+  sendNTPpacket(ntpServerIP);
+  uint32_t beginWait = millis();
+  while (millis() - beginWait < 1500) {
+    int size = Udp.parsePacket();
+    if (size >= NTP_PACKET_SIZE) {
+      Serial.println("Receive NTP Response");
+      Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
+      unsigned long secsSince1900;
+      // convert four bytes starting at location 40 to a long integer
+      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+      secsSince1900 |= (unsigned long)packetBuffer[43];
+      return secsSince1900 - 2208988800UL + tZoneI * SECS_PER_HOUR + timeSummerWinterI * SECS_PER_HOUR;
+    }
+  }
+  Serial.println("No NTP Response :-(");
+  return 0; // return 0 if unable to get the time
+}
+
+// send an NTP request to the time server at the given address
+void sendNTPpacket(IPAddress &address)
+{
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+}
+
+void draw(){
+//temperature  
+  display.setTextSize(1);
+  display.setCursor(1,6);
+  display.setTextColor(CYAN);
+  display.println(utf8("T:             CO2:"));
+
+  String t_p;
+         t_p = String(t); 
+         char t_p_m [12];
+        t_p.toCharArray(t_p_m, 5);
+
+ if (t != t_old) { 
+  display.fillRect(1,15,48,18,BLACK);
+  display.setTextSize(2);
+  display.setCursor(1,15);
+  display.setTextColor(GREEN);
+  if(t < Tmin) display.setTextColor(RED);
+  if(t > Tmax) display.setTextColor(RED);
+ if ((t > -100) and (t < 100)) display.println(utf8(String(t_p_m)));
+  else display.println(utf8("----"));}
+
+//heat index 
+  display.setTextSize(1);
+  display.setCursor(2,98);
+  display.setTextColor(CYAN);
+  display.println(utf8("H:               Ti:"));
+
+  String hic_p;
+         hic_p = String(hic); 
+         char hic_p_m [12];
+        hic_p.toCharArray(t_p_m, 5);
+
+ if (hic != hic_old) { 
+  display.fillRect(80,108,48,18,BLACK);
+  display.setTextSize(2);
+  display.setCursor(80,108);
+  display.setTextColor(GREEN);
+ // if(t < Tmin) display.setTextColor(RED);
+  if(hic > 27.0) display.setTextColor(YELLOW);
+  if(hic > 31.0) display.setTextColor(RED);
+ if ((hic > 0) and (hic < 100)) display.println(utf8(String(t_p_m)));
+  else display.println(utf8("----"));}
+
+//CO2
+ if (co2 != co2_old) {
+  display.fillRect(80,15,48,18,BLACK);
+  display.setTextSize(2);
+  display.setCursor(80,15);
+  display.setTextColor(GREEN);
+  if (co2 > Cmax) display.setTextColor(RED);
+  if (co2 > 600) display.setTextColor(CYAN);  
+  if ((co2 > -1)  and (co2 <= 2000)) display.println(utf8(String(co2))); else display.println(utf8("---"));
+ }
+
+//humidity
+if (h != h_old) {
+  display.fillRect(1,108,49,18,BLACK);
+  display.setTextSize(2);
+  display.setCursor(1,108);
+  display.setTextColor(GREEN);
+  if (h < Hmin) display.setTextColor(RED);
+  if (h > 60) display.setTextColor(RED);
+  if ((h > -1) and (h < 100)) display.println(utf8(String(h))); else display.println(utf8("--"));
+ }
+
+//date    
+ if (hh==0) display.fillRect(28,1,60,10,BLACK);
+  display.setCursor(28,1);
+  display.setTextSize(1);
+  display.setTextColor(CYAN);
+  display.println(utf8(date_r)); 
+
+//OFFLINE
+if (md == 2)
+{  
+  display.fillRect(106,44,18,8,RED);
+  display.setCursor(106,44);
+  display.setTextSize(1);
+  display.setTextColor(CYAN);
+  display.println(" A");  
+  }
+
+//OFF BLYNK
+if (blnk == 1)
+{ display.fillRect(106,44,18,8,RED);
+  display.setCursor(106,44);
+  display.setTextSize(1);
+  display.setTextColor(CYAN);
+  display.println(" B");  
+  }
+}
+
+void synchronClockA() {
+  Rtc.Begin();
+  Serial.print("IP number assigned by DHCP is ");
+  Serial.println(WiFi.localIP());
+  Serial.println("Starting UDP");
+  Udp.begin(localPort);
+  Serial.print("Local port: ");
+  Serial.println(Udp.localPort());
+  Serial.println("waiting for sync");
+  setSyncProvider(getNtpTime);
+  //setSyncInterval(300);
+  if(timeStatus() != timeNotSet){
+    digitalClockDisplay();
+    Serial.println("here is another way to set rtc");
+      time_t t = now();
+      char date_0[12];
+      snprintf_P(date_0, countof(date_0), PSTR("%s %02u %04u"), monthShortStr(month(t)), day(t), year(t));
+      Serial.println(date_0);
+      char time_0[9];
+      snprintf_P(time_0, countof(time_0), PSTR("%02u:%02u:%02u"), hour(t), minute(t), second(t));
+      Serial.println(time_0);
+      Serial.println("Now its time to set up rtc");
+      RtcDateTime compiled = RtcDateTime(date_0, time_0);
+ //      printDateTime(compiled);
+       Serial.println("");
+
+        if (!Rtc.IsDateTimeValid()) 
+    {
+        // Common Cuases:
+        //    1) first time you ran and the device wasn't running yet
+        //    2) the battery on the device is low or even missing
+
+        Serial.println("RTC lost confidence in the DateTime!");
+
+        // following line sets the RTC to the date & time this sketch was compiled
+        // it will also reset the valid flag internally unless the Rtc device is
+        // having an issue
+
+    }
+     Rtc.SetDateTime(compiled);
+     RtcDateTime now = Rtc.GetDateTime();
+    if (now < compiled) 
+    {
+        Serial.println("RTC is older than compile time!  (Updating DateTime)");
+        Rtc.SetDateTime(compiled);
+    }
+    else if (now > compiled) 
+    {
+        Serial.println("RTC is newer than compile time. (this is expected)");
+    }
+    else if (now == compiled) 
+    {
+        Serial.println("RTC is the same as compile time! (not expected but all is fine)");
+    }
+
+    // never assume the Rtc was last configured by you, so
+    // just clear them to your needed state
+    Rtc.Enable32kHzPin(false);
+    Rtc.SetSquareWavePin(DS3231SquareWavePin_ModeNone); 
+  }
+}
+
+void synchronClock() {
+  Rtc.Begin();
+ // WiFi.begin(lnet, key);
+   wifiManager.autoConnect(ssid.c_str(), pass.c_str());
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" ");
+  Serial.print("IP number assigned by DHCP is ");
+  Serial.println(WiFi.localIP());
+  Serial.println("Starting UDP");
+  Udp.begin(localPort);
+  Serial.print("Local port: ");
+  Serial.println(Udp.localPort());
+  Serial.println("waiting for sync");
+  setSyncProvider(getNtpTime);
+
+  if(timeStatus() != timeNotSet){
+    digitalClockDisplay();
+    Serial.println("here is another way to set rtc");
+      time_t t = now();
+      char date_0[12];
+      snprintf_P(date_0, countof(date_0), PSTR("%s %02u %04u"), monthShortStr(month(t)), day(t), year(t));
+      Serial.println(date_0);
+      char time_0[9];
+      snprintf_P(time_0, countof(time_0), PSTR("%02u:%02u:%02u"), hour(t), minute(t), second(t));
+      Serial.println(time_0);
+      Serial.println("Now its time to set up rtc");
+      RtcDateTime compiled = RtcDateTime(date_0, time_0);
+
+       Serial.println("");
+
+        if (!Rtc.IsDateTimeValid()) 
+    {
+        // Common Cuases:
+        //    1) first time you ran and the device wasn't running yet
+        //    2) the battery on the device is low or even missing
+
+        Serial.println("RTC lost confidence in the DateTime!");
+
+        // following line sets the RTC to the date & time this sketch was compiled
+        // it will also reset the valid flag internally unless the Rtc device is
+        // having an issue
+
+    }
+     Rtc.SetDateTime(compiled);
+     RtcDateTime now = Rtc.GetDateTime();
+    if (now < compiled) 
+    {
+        Serial.println("RTC is older than compile time!  (Updating DateTime)");
+        Rtc.SetDateTime(compiled);
+    }
+    else if (now > compiled) 
+    {
+        Serial.println("RTC is newer than compile time. (this is expected)");
+    }
+    else if (now == compiled) 
+    {
+        Serial.println("RTC is the same as compile time! (not expected but all is fine)");
+    }
+
+    // never assume the Rtc was last configured by you, so
+    // just clear them to your needed state
+    Rtc.Enable32kHzPin(false);
+    Rtc.SetSquareWavePin(DS3231SquareWavePin_ModeNone); 
+}
+}
+
+void Clock(){
+    RtcDateTime now = Rtc.GetDateTime();
+    //Print RTC time to Serial Monitor
+   hh = now.Hour();
+   mm = now.Minute(); 
+   ss = now.Second();
+
+  sprintf(date_r, "%d.%d.%d", now.Day(), now.Month(), now.Year());
+  if  (mm < 10) sprintf(time_r, "%d:0%d", hh, mm);
+  else sprintf(time_r, "%d:%d", hh, mm);
+
+   Serial.println(date_r);
+   Serial.println(time_r);
+   }
+
+//analog
+void drawClockFace(){
+  display.fillCircle(ccenterx, ccentery, cradius, BLUE);
+  display.fillCircle(ccenterx, ccentery, cradius-4, BLACK);
+  // Draw 12 lines
+  for(int i = 0; i<360; i+= 30) {
+    sx = cos((i-90)*scosConst);
+    sy = sin((i-90)*scosConst);
+    x0 = sx*(cradius)+ccenterx;
+    yy0 = sy*(cradius)+ccentery;
+    x1 = sx*(cradius-8)+ccenterx;
+    yy1 = sy*(cradius-8)+ccentery;
+    display.drawLine(x0, yy0, x1, yy1, 0x0377);
+  }
+  // Draw 4 lines
+  for(int i = 0; i<360; i+= 90) {
+    sx = cos((i-90)*scosConst);
+    sy = sin((i-90)*scosConst);
+    x0 = sx*(cradius+6)+ccenterx;
+    yy0 = sy*(cradius+6)+ccentery;
+    x1 = sx*(cradius-11)+ccenterx;
+    yy1 = sy*(cradius-11)+ccentery;
+    display.drawLine(x0, yy0, x1, yy1, 0x0377);
+  }  
+}
+//analog
+static uint8_t conv2d(const char* p) {
+  uint8_t v = 0;
+  if ('0' <= *p && *p <= '9') v = *p - '0';
+  return 10 * v + *++p - '0';
+}
+
+//analog  
+void drawClockHands(uint8_t h,uint8_t m,uint8_t s){
+  // Pre-compute hand degrees, x & y coords for a fast screen update
+  sdeg = s * 6;                  // 0-59 -> 0-354
+  mdeg = m * 6 + sdeg * 0.01666667;  // 0-59 -> 0-360 - includes seconds
+  hdeg = h * 30 + mdeg * 0.0833333;  // 0-11 -> 0-360 - includes minutes and seconds
+  hx = cos((hdeg-90)*scosConst);    
+  hy = sin((hdeg-90)*scosConst);
+  mx = cos((mdeg-90)*scosConst);    
+  my = sin((mdeg-90)*scosConst);
+  sx = cos((sdeg-90)*scosConst);    
+  sy = sin((sdeg-90)*scosConst);
+
+  // Erase just old hand positions
+  display.drawLine(ohx, ohy, ccenterx+1, ccentery+1, BLACK);  
+  display.drawLine(omx, omy, ccenterx+1, ccentery+1, BLACK);  
+  display.drawLine(osx, osy, ccenterx+1, ccentery+1, BLACK);
+  // Draw new hand positions  
+  display.drawLine(hx*(cradius-20)+ccenterx+1, hy*(cradius-20)+ccentery+1, ccenterx+1, ccentery+1, WHITE);
+  display.drawLine(mx*(cradius-8)+ccenterx+1, my*(cradius-8)+ccentery+1, ccenterx+1, ccentery+1, WHITE);
+  display.drawLine(sx*(cradius-8)+ccenterx+1, sy*(cradius-8)+ccentery+1, ccenterx+1, ccentery+1, RED);
+  display.fillCircle(ccenterx+1, ccentery+1, 3, RED);
+
+  // Update old x&y coords
+  osx = sx*(cradius-8)+ccenterx+1;
+  osy = sy*(cradius-8)+ccentery+1;
+  omx = mx*(cradius-8)+ccenterx+1;
+  omy = my*(cradius-8)+ccentery+1;
+  ohx = hx*(cradius-20)+ccenterx+1;
+  ohy = hy*(cradius-20)+ccentery+1;
+}
+void  FaceClock(){
+ display.clearScreen();
+ display.setTextColor(WHITE, BLACK);
+  osx = ccenterx;
+  osy = ccentery;
+  omx = ccenterx;
+  omy = ccentery;
+  ohx = ccenterx;
+  ohy = ccentery;
+  drawClockFace();// Draw clock face  
+}
+
+void drawSynchron() {
+        display.clearScreen();
+        display.setTextSize(2);
+        display.setCursor(2,48);
+        display.setTextColor(WHITE);
+        display.println(utf8("      Clock"));
+        display.setTextSize(1);
+        display.setCursor(2,68);
+        display.setTextColor(WHITE);
+        display.println(utf8("synchronization..."));
+      } 
+
+void drawWiFi() {
+        display.clearScreen();
+        display.setTextSize(2);
+        display.setCursor(2,48);
+        display.setTextColor(RED);
+        display.println(utf8("Connection to Wi-Fi"));
+      }
+
+void drawBlynk() {
+        display.clearScreen();
+        display.setTextSize(2);
+        display.setCursor(2,48);
+        display.setTextColor(RED);
+        display.println(utf8("Connection to Blynk"));
+}
+
+void mailer() {
+     // wait for WiFi connection
+    if((WiFiMulti.run() == WL_CONNECTED)) {
+
+        HTTPClient http;
+
+        Serial.print("[HTTP] begin...\n");
+
+        http.begin("http://skorovoda.in.ua/php/wst41.php?mymail="+String(address)+"&t="+String(t) +"&h="+String(h)+"&co2="+String(co2)+"&ID="+String(ESP.getChipId()));
+
+        Serial.print("[HTTP] GET...\n");
+        // start connection and send HTTP header
+        int httpCode = http.GET();
+
+        // httpCode will be negative on error
+        if(httpCode > 0) {
+            // HTTP header has been send and Server response header has been handled
+            Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+
+            // file found at server
+            if(httpCode == HTTP_CODE_OK) {
+                String payload = http.getString();
+                Serial.println(payload);
+            }
+        } else {
+            Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+        }
+        http.end();
+    }   
+}
+
+//callback notifying the need to save config
+void saveConfigCallback() {
+        Serial.println("Should save config");
+        shouldSaveConfig = true;
+}
+void factoryReset() {
+        Serial.println("Resetting to factory settings");
+        wifiManager.resetSettings();
+        SPIFFS.format();
+        ESP.reset();
+}
+void printString(String str) {
+        Serial.println(str);
+}
+
+bool loadConfigS() {
+        Blynk.config(address);  
+        Serial.print("e-mail: ");  
+        Serial.println(  address );   
+
+        Blynk.config(tZ);  
+        Serial.print("T_Zone: ");  
+        Serial.println(  tZ );
+
+        Blynk.config(Tmx);  
+        Serial.print("T max: ");  
+        Serial.println(  Tmx );   
+
+        Blynk.config(Cmx);  
+        Serial.print("CO2 max: ");  
+        Serial.println(  Cmx );   
+
+        Blynk.config(Tmn);  
+        Serial.print("T min: ");  
+        Serial.println(  Tmn );   
+
+        Blynk.config(Hmn);  
+        Serial.print("H min: ");  
+        Serial.println(  Hmn ); 
+
+        Blynk.config(timeSW);  
+        Serial.print("Time Summer/Winter: ");  
+        Serial.println( timeSW ); 
+
+        Blynk.config(formFS);  
+        Serial.print("format FS: ");  
+        Serial.println( formFS );               
+
+        Blynk.config(blynk_token, "blynk-cloud.com", 8442);   
+        Serial.print("token: " );
+        Serial.println(  blynk_token  );     
+}
+
+bool loadConfig() {
+        Serial.println("Load config...");
+        File configFile = SPIFFS.open("/config.json", "r");
+        if (!configFile) {
+                Serial.println("Failed to open config file");
+                return false;
+        }
+
+        size_t size = configFile.size();
+        if (size > 1024) {
+                Serial.println("Config file size is too large");
+                return false;
+        }
+
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        // We don't use String here because ArduinoJson library requires the input
+        // buffer to be mutable. If you don't use ArduinoJson, you may as well
+        // use configFile.readString instead.
+        configFile.readBytes(buf.get(), size);
+
+        StaticJsonBuffer<200> jsonBuffer;
+        JsonObject &json = jsonBuffer.parseObject(buf.get());
+
+        if (!json.success()) {
+                Serial.println("Failed to parse config file");
+                return false;
+        }
+
+        // Save parameters
+        strcpy(blynk_token, json["blynk_token"]);
+        strcpy(address, json["address"]);
+        strcpy(tZ, json["tZ"]);
+        strcpy(Tmx, json["Tmx"]);
+        strcpy(Cmx, json["Cmx"]);
+        strcpy(Tmn, json["Tmn"]);
+        strcpy(Hmn, json["Hmn"]);
+        strcpy(timeSW, json["timeSW"]);
+        strcpy(formFS, json["formFS"]);      
+}
+
+void configModeCallback (WiFiManager *wifiManager) {
+        String url {"http://192.168.4.1"};
+        printString("Connect to WiFi:");
+        printString("net: " + ssid);
+        printString("pw: "+ pass);
+        printString("Open browser:");
+        printString(url);
+        printString("to setup device");
+
+        drawConnectionDetails();
+}
+
+void setupWiFi() {
+        //set config save notify callback
+        wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+        // Custom parameters
+         WiFiManagerParameter custom_blynk_token("blynk_token", "Blynk token", blynk_token, 34);
+         wifiManager.addParameter(&custom_blynk_token);
+         WiFiManagerParameter custom_address("address", "E-mail", address, 64);
+         wifiManager.addParameter(&custom_address);
+         WiFiManagerParameter custom_tZ("tZ", "Time Zone", tZ, 5); 
+         wifiManager.addParameter(&custom_tZ);
+         WiFiManagerParameter custom_Tmn("Tmn", "T min", Tmn, 5);  
+         wifiManager.addParameter(&custom_Tmn);                  
+         WiFiManagerParameter custom_Tmx("Tmx", "T max", Tmx, 5); 
+         wifiManager.addParameter(&custom_Tmx);         
+         WiFiManagerParameter custom_Cmx("Cmx", "C max", Cmx, 7);  
+         wifiManager.addParameter(&custom_Cmx);
+         WiFiManagerParameter custom_Hmn("Hmn", "H min", Hmn, 5);  
+         wifiManager.addParameter(&custom_Hmn); 
+         WiFiManagerParameter custom_timeSW("timeSW", "Time Summer(1)/Winter(0)", timeSW, 4);  
+         wifiManager.addParameter(&custom_timeSW);     
+         WiFiManagerParameter custom_formFS("formFS", "formating FS", formFS, 4);  
+         wifiManager.addParameter(&custom_formFS);     
+
+        wifiManager.setAPCallback(configModeCallback);
+
+        wifiManager.setTimeout(60);
+
+        if (!wifiManager.autoConnect(ssid.c_str(), pass.c_str())) {
+        md = 2;
+        Serial.println("mode OffLINE :(");
+        loadConfigS();         
+        }
+
+        //save the custom parameters to FS
+        if (shouldSaveConfig) {
+                Serial.println("saving config");
+                DynamicJsonBuffer jsonBuffer;
+                JsonObject &json = jsonBuffer.createObject();
+
+                json["blynk_token"] = custom_blynk_token.getValue();                
+                json["address"] = custom_address.getValue();
+                json["tZ"] = custom_tZ.getValue(); 
+                json["Tmx"] = custom_Tmx.getValue(); 
+                json["Cmx"] = custom_Cmx.getValue(); 
+                json["Tmn"] = custom_Tmn.getValue(); 
+                json["Hmn"] = custom_Hmn.getValue(); 
+                json["timeSW"] = custom_timeSW.getValue();
+                json["formFS"] = custom_formFS.getValue();
+
+                File configFile = SPIFFS.open("/config.json", "w");
+                if (!configFile) {
+                        Serial.println("failed to open config file for writing");
+                }
+
+                json.printTo(Serial);
+                json.printTo(configFile);
+                configFile.close();
+                //end save
+        }
+
+        //if you get here you have connected to the WiFi
+        Serial.println("WiFi connected");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+}
+
+void connectBlynk(){ 
+       if(String(blynk_token)== "Blynk token"){
+        blnk = 0;
+        Serial.println("! Off Blynk!");
+        } else {
+        Serial.println("Connecting to blynk...");
+        while (Blynk.connect() == false) {
+        delay(500);
+        Serial.println("Connecting to blynk...");
+        }    
+    } 
+}
+
+void sendToBlynk(){
+        Blynk.virtualWrite(V1, t);
+        Blynk.virtualWrite(V2, h);
+        Blynk.virtualWrite(V3, co2);
+        Blynk.virtualWrite(V5, hic);
+}
+
+void formatFS(){
+          SPIFFS.format();  
+          SPIFFS.begin();  
+}
+
+void setup() {  
+        Serial.begin(115200);
+
+        display.begin();    
+
+        // Init filesystem
+        if (!SPIFFS.begin()) {
+                Serial.println("Failed to mount file system");
+                ESP.reset();
+        }
+        md = 1;
+        // Setup WiFi
+        drawWiFi();   //"Connecting to Wi-Fi..."
+        setupWiFi();
+       if(md == 1){  
+
+        // Load configuration           
+        if (!loadConfig()) {
+                Serial.println("Failed to load config");
+             //   factoryReset();
+        } else {
+                Serial.println("Config loaded");
+        }   
+
+        Blynk.config(address);  
+        Serial.print("e-mail: ");  
+        Serial.println(  address );   
+
+        Blynk.config(tZ);  
+        Serial.print("T_Zone: ");  
+        Serial.println(  tZ );
+
+        Blynk.config(Tmx);  
+        Serial.print("T max: ");  
+        Serial.println(  Tmx );   
+
+        Blynk.config(Cmx);  
+        Serial.print("CO2 max: ");  
+        Serial.println(  Cmx );   
+
+        Blynk.config(Tmn);  
+        Serial.print("T min: ");  
+        Serial.println(  Tmn );   
+
+        Blynk.config(Hmn);  
+        Serial.print("H min: ");  
+        Serial.println(  Hmn ); 
+
+        Blynk.config(timeSW);  
+        Serial.print("Time Summer/Winter: ");  
+        Serial.println( timeSW ); 
+
+        Blynk.config(formFS);  
+        Serial.print("format FS: ");  
+        Serial.println( formFS );                               
+
+        Blynk.config(blynk_token, "blynk-cloud.com", 8442);   
+        Serial.print("token: " );
+        Serial.println(  blynk_token  );
+
+        Tmax = atof (Tmx);   
+        Cmax = atof (Cmx); 
+        Tmin = atof (Tmn);  
+        Hmin = atof (Hmn);
+        tZone = atof (tZ);
+        timeSummerWinter = atof (timeSW);  
+        formatingFS = atof (formFS);
+
+        drawSynchron();
+        synchronClock();
+        connectBlynk(); 
+        FaceClock(); 
+
+     if (formatingFS == 1) {
+        formatFS();    
+       }                      
+       }
+     else if(md == 2)
+     {
+
+        Tmax = atof (Tmx);   
+        Cmax = atof (Cmx); 
+        Tmin = atof (Tmn);  
+        Hmin = atof (Hmn);
+        tZone = atof (tZ);
+        timeSummerWinter = atof (timeSW);  
+        formatingFS = atof (formFS);
+
+        synchronClockA();
+        FaceClock();
+
+     if (formatingFS == 1) {
+        formatFS();    
+       }
+     }   
+}
+
+void loop() {
+ if (md == 2) Serial.println(":( OffLINE");  
+ else if (md == 1) Serial.println(":) OnLINE");       
+  sendMeasurements();
+  draw();
+  Clock();
+  drawClockHands(hh,mm,ss); 
+
+   if (ml >= 480000) ml = 0;   //обнуление счетчика
+   if ((ml >= 20000) and ((t > Tmax) or (co2 > Cmax) or (t < Tmin) or (h < Hmin)))
+        {
+        mailer();
+         ml = 0;
+         }
+
+       Blynk.run();       
+       if  (bl > 210){ // 30 sec
+            sendToBlynk();
+            Serial.println("Отправка данных на Blynk");
+            bl = 0;
+              }
+
+          bl++;
+          ml++;
+
+          delay(100);         
+          t_old = t;
+          hic_old = hic;
+          h_old = h;
+          co2_old = co2;
+          Serial.println(" ");
+}
